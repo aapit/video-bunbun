@@ -3,7 +3,7 @@
 Plugin Name:  Video BunBun
 Plugin URI:   https://github.com/aapit/video-bunbun
 Description:  Synchronizes uploaded videos with Bunny.net Stream service
-              Note: Turn on Security / Direct Play
+              Note: Turn on Security > Direct Play, MP4 fallback
 Version:      1.0.0
 Author:       David Spreekmeester
 Author URI:   https://spreekmeester.nl
@@ -36,7 +36,7 @@ class BunnyStreamVideoLib {
             'headers' => $this->_createRequestHeaders(),
         ]);
         if ($response->getStatusCode() == '200') {
-            return json_decode($response->getBody());
+            return json_decode($response->getBody(), true);
         }
     }
 
@@ -52,8 +52,8 @@ class BunnyStreamVideoLib {
         ]);
 
         if ($response->getStatusCode() == '200') {
-            $respArr = json_decode($response->getBody());
-            return $respArr->guid;
+            $respArr = json_decode($response->getBody(), true);
+            return $respArr['guid'];
         } else throw new Exception($response->getStatusCode());
     }
 
@@ -112,12 +112,8 @@ function bunbun_after_upload($attachmentId) {
         $videoId = $videoLib->createVideo("Unnamed video");
         $response = $videoLib->uploadVideo($videoId, $filePath);
         $videoData = $videoLib->getVideo($videoId);
-//error_log()
-//print_r($videoData);
-//die();
         update_post_meta($attachmentId, 'bun_video_id', $videoId);
     }
-
 }
 
 add_action('add_attachment', 'bunbun_after_upload');
@@ -250,12 +246,12 @@ add_action('admin_init', 'bun_register_settings');
 
 // __________ DISPLAY ON FRONTEND _____________
 /**
- * Filtert de waarde van het 'background_video' veld voordat deze wordt weergegeven.
+ * Replaces the local background video with a Bunny hosted version.
  *
- * @param mixed $value De oorspronkelijke waarde van het ACF veld (waarschijnlijk een URL/ID).
- * @param int $post_id De ID van de post waar het veld bij hoort.
- * @param array $field De volledige array van het ACF veld.
- * @return mixed De gewijzigde waarde (URL, ID, of HTML).
+ * @param mixed $value The original value of the ACF field (probably a URL / ID)
+ * @param int $post_id The ID of the post this field belongs to
+ * @param array $field The full array of the ACF field
+ * @return mixed The modified value (URL, ID, or HTML).
  */
 function bun_replace_acf_video_field($value, $postId, $field) {
     if (!is_array($value)) {
@@ -265,19 +261,14 @@ function bun_replace_acf_video_field($value, $postId, $field) {
     $attachment_id = isset($value['ID']) ? $value['ID'] : 0;
 
     if ($attachment_id) {
-        //$newUrl = get_post_meta($attachment_id, '_mijn_verwerkte_video_url', true);
-
         $meta = get_post_meta($attachment_id);
         if (
             array_key_exists('bun_video_id', $meta) &&
             array_key_exists(0, $meta['bun_video_id'])
         ) {
             $videoId = $meta['bun_video_id'][0];
-            print_r($meta);
-            $hostname = 'iframe.mediadelivery.net';
-            #$hostname = get_option('bun_cdn_hostname');
-            $libraryId = get_option('bun_library_id');
-            $newUrl = 'https://' . $hostname . '/play/' . $libraryId . '/' . $videoId;
+            $hostname = get_option('bun_cdn_hostname');
+            $newUrl = 'https://' . $hostname . '/' . $videoId . '/play_720p.mp4';
             if ($newUrl) {
                 $value['url'] = $newUrl;
             }
@@ -286,14 +277,67 @@ function bun_replace_acf_video_field($value, $postId, $field) {
     }
 
     return $value;
-    /*
-    echo "<pre>";
-    echo "attachmentId: " . $attachmentId;
-    echo '<br/>';
-    print_r($field);
-    echo "</pre>";
-    */
 }
 
-// Koppel de functie aan de ACF filter voor jouw specifieke veldnaam
 add_filter('acf/format_value/name=background_video', 'bun_replace_acf_video_field', 10, 3);
+
+
+// ----------------- Bunny API Callback -----------------
+
+function bun_validate_webhook_signature(WP_REST_Request $request) {
+    // TODO: Validate url signature from webhook
+    return true;
+}
+
+/**
+ * Process the incoming webhook from Bunny.net Stream.
+ *
+ * @param WP_REST_Request $request Het inkomende verzoekobject.
+ * @return WP_REST_Response
+ */
+function bun_process_webhook_data(WP_REST_Request $request) {
+    $data = $request->get_json_params();
+
+    if (!bun_validate_webhook_signature($request)) {
+        return new WP_REST_Response(array('success' => false, 'message' => 'Invalid signature'), 401);
+    }
+
+    $bunny_video_id = $data['VideoGuid'] ?? null;
+    $status         = $data['Status'] ?? null;
+
+    if ($status === 4 && $bunny_video_id) {
+        $posts = get_posts(array(
+            'post_type'  => 'attachment',
+            'meta_key'   => 'bun_video_id',
+            'meta_value' => $bunny_video_id,
+            'posts_per_page' => 1,
+            'fields'     => 'ids',
+        ));
+
+        if (!empty($posts)) {
+            $attachment_id = $posts[0];
+            update_post_meta($attachment_id, '_bunny_verwerking_klaar', time());
+
+            return new WP_REST_Response(array('success' => true, 'message' => 'Verwerking voltooid en meta bijgewerkt.'), 200);
+        }
+
+        return new WP_REST_Response(array('success' => false, 'message' => 'Attachment niet gevonden.'), 404);
+    }
+
+    // Antwoord altijd met 200/204, anders blijft Bunny het proberen bij tijdelijke fouten.
+    return new WP_REST_Response(array('success' => true, 'message' => 'Status niet relevant of niet klaar.'), 200);
+}
+
+// Functie om je custom REST endpoint te registreren
+function bun_register_webhook_endpoint() {
+    register_rest_route(
+        'video-bunbun-webhook/v1', // Namespace: jouw-plugin/versie
+        '/status-update',   // Route: de laatste URL component
+        array(
+            'methods' => 'POST',
+            'callback' => 'bun_process_webhook_data',
+            'permission_callback' => '__return_true',
+        )
+    );
+}
+add_action('rest_api_init', 'bun_register_webhook_endpoint');
